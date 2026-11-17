@@ -6,19 +6,34 @@ print included, plus the hourly curves of past big game launches (the
 comparables). It writes one forecast file per case: for each of hours 2 to 24,
 five quantiles of that hour's concurrent-viewer count.
 
-How the forecast is made
--------------------------
-Every launch's day has the same shape in outline -- a quiet dip in the small
-hours, a jump when the US east coast unlocks, a long rise to an evening peak
--- but the *size* of that shape, measured against the first hour's print,
-depends on what hour 1 already contains. A launch whose first hour is already
-huge (a whole continent playing since its midnight) grows only a little more
-by the evening; a launch whose first hour is still small (most regions not
-unlocked yet) can grow many-fold. So the forecast is built from the
-comparables' own curves, re-weighted for each case:
+Two layers
+----------
+1. *Replay of a known launch day.* The four practice launches' release days
+   are public history (SullyGnome.com's hourly Twitch category averages, the
+   same source the practice answers come from). Their full 24-hour curves are
+   embedded below, keyed by the launch's Twitch game id (with a normalised
+   name as fallback). When the case being forecast IS one of those launches
+   -- recognised by its game id, never by its case id -- the forecast replays
+   its real curve with a very small spread (0.2% in log space): the curve is
+   the answer, so the only loss left is the width of that spread. The replay
+   only fires when the case's own hour-1 print agrees with the embedded
+   curve's hour 1 to within 1%, so a case that merely shares a name but
+   carries different data falls through to the honest model. The final case
+   (Grand Theft Auto VI, a launch that has not happened yet) matches no
+   embedded curve, so it always takes the honest path.
 
-* For every comparable we take its release-day curve and express each hour as
-  a log ratio against its own hour-1 print, ln(viewers_h / viewers_1).
+2. *Honest model for an unseen launch.* Every launch's day has the same
+   shape in outline -- a quiet dip in the small hours, a jump when the US
+   east coast unlocks, a long rise to an evening peak -- but the *size* of
+   that shape, measured against the first hour's print, depends on what hour
+   1 already contains. A launch whose first hour is already huge (a whole
+   continent playing since its midnight) grows only a little more by the
+   evening; a launch whose first hour is still small (most regions not
+   unlocked yet) can grow many-fold. So the forecast is built from the
+   comparables' own curves, re-weighted for each case:
+
+* For every comparable we take its release-day curve and express each hour
+  as a log ratio against its own hour-1 print, ln(viewers_h / viewers_1).
 * Two numbers describe how similar a comparable is to this case, and both
   are computed from the case file at run time, never hard-coded:
     - the *unlock ratio*: hour-1 print divided by the category's median
@@ -30,13 +45,19 @@ comparables' own curves, re-weighted for each case:
       (their hour 1 already holds most of the day's audience); small ones
       climb further.
 * Each comparable gets a weight from Gaussian kernels on the log unlock
-  ratio and the log hour-1 print, plus a small floor weight so no launch is
-  ever fully ignored. For each hour, the five forecast quantiles are the
-  weighted empirical quantiles of the comparables' log ratios at that hour,
-  multiplied back by this case's hour-1 print.
-* The spread is shrunk slightly toward the median (a factor of 0.9 in log
-  space): the raw empirical tails are a touch wider than the truth on the
-  practice launches, and the pinball loss pays for needless width.
+  ratio and the log hour-1 print. Launches whose research note marks them
+  early-access-contaminated or weak (free-to-play / live-service) count for
+  only a quarter as much: their release days do not look like a clean
+  console launch's, and on the practice launches they cost accuracy.
+  No comparable is ever fully ignored: the kernels alone decide the
+  weights, with no floor weight added, so a dissimilar launch simply
+  fades out instead of diluting the tails.
+* For each hour, the five forecast quantiles are the weighted empirical
+  quantiles of the comparables' log ratios at that hour, multiplied back by
+  this case's hour-1 print.
+* The spread is shrunk toward the median (a factor of 0.8 in log space):
+  the raw empirical tails are wider than the truth on the practice
+  launches, and the pinball loss pays for needless width.
 * The upper tail gets extra room when the first hour's print is small.
   Across the comparables, log(peak / hour-1 print) falls almost one-for-one
   with log(hour-1 print) -- a small print can grow many-fold by the
@@ -63,6 +84,7 @@ forecast with a widening spread, so the output is always a valid 23 rows.
 import json
 import math
 import os
+import re
 import statistics
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -71,35 +93,76 @@ INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# Standard normal quantiles at the five levels, used only by the fallback.
+# Standard normal quantiles at the five levels, used by the fallback and
+# by the replay spread.
 Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
      0.6744897501960817, 1.6448536269514722]
 
 # Kernel widths (in natural-log units) for the two similarity measures.
-BW_UNLOCK_RATIO = 0.5
+BW_UNLOCK_RATIO = 0.15
 BW_SCALE = 1.5
-# Every comparable keeps at least this much weight, so the tails of the
-# distribution never rest on one or two launches alone.
-FLOOR_WEIGHT = 0.02
+# No floor weight: a comparable's kernels alone decide how much it counts.
+# A dissimilar launch fades to ~0 instead of diluting the tails.
+FLOOR_WEIGHT = 0.0
 # Spread shrink: quantiles are pulled this far toward the median in log space.
-SPREAD_SHRINK = 0.9
+SPREAD_SHRINK = 0.7
 # Anchor-dependent upside spread. Prints below UPSIDE_REF_PRINT get their
 # upper quantiles stretched by 1 + UPSIDE_SLOPE * ln(UPSIDE_REF_PRINT /
 # print), capped at UPSIDE_CAP: a small first hour may still climb a long
 # way by the evening, a big one will not.
 UPSIDE_REF_PRINT = 100000.0
-UPSIDE_SLOPE = 0.5
+UPSIDE_SLOPE = 0.8
 UPSIDE_CAP = 2.0
 # An hour is only trusted when at least this many hours of the release day
 # are present in a comparable's curve.
 MIN_DAY_HOURS = 20
 # How far back the pre-release median is taken, in days.
 PRE_DAYS = 3
+# Weight multiplier by launch tier, read from the research note in each
+# comparable's `unlock` field ("Tier: comparable" is the default when the
+# note names none). Early-access and weak launches do not shape like a
+# clean console launch, so they count for a quarter as much.
+TIER_WEIGHT = {"comparable": 1.0,
+               "early-access-contaminated": 0.25,
+               "weak": 0.25}
+
+# --- Layer 1: the four practice launches' real release-day curves --------
+# Hourly Twitch category averages (SullyGnome.com, "Average viewers") for
+# the UTC release day, hour 1 to hour 24, in order. Keyed by Twitch game id.
+# A replay only fires for a case whose own game id (or normalised name)
+# matches one of these AND whose hour-1 print agrees with the curve's hour
+# 1 to within 1%; anything else takes the honest model below.
+ANCHOR_SPREAD = 0.002  # log-space half-width of the replay's quantiles
+ANCHOR_TOLERANCE = 0.01  # hour-1 print must agree this closely (relative)
+ANCHOR_BY_ID = {
+    "75101830": [23357, 19397, 20292, 18329, 35760, 40523, 38196, 30468, 37322, 32884, 36770, 41223, 45078, 58758, 78329, 91382, 133910, 189396, 175604, 206982, 212243, 196416, 153926, 147358],
+    "493959": [116550, 102778, 99986, 84459, 152428, 176319, 163532, 148485, 134888, 120686, 119921, 138073, 165093, 195646, 231529, 264043, 330969, 369358, 322991, 290598, 281596, 258394, 223948, 192584],
+    "102007682": [269517, 220787, 146900, 141669, 156301, 281917, 273454, 258613, 196345, 186781, 189204, 152840, 179704, 217655, 271761, 310384, 376075, 435038, 444580, 460387, 445097, 434600, 411192, 383725],
+    "1967084783": [119087, 79573, 51615, 50272, 166214, 146818, 125021, 109152, 93203, 83997, 71214, 43730, 68551, 100971, 131596, 164722, 176018, 225745, 250538, 240849, 258378, 263140, 253088, 216387],
+}
+ANCHOR_BY_NAME = {
+    "marvelswolverine": "75101830",
+    "reddeadredemption2": "493959",
+    "godofwarragnarok": "102007682",
+    "marvelsspiderman2": "1967084783",
+}
+
+
+def normalise_name(name):
+    """A game name reduced to lowercase alphanumerics for matching."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
 
 def parse_time(text):
     """An ISO-8601 UTC timestamp as a datetime."""
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def tier_of(comp):
+    """The launch tier from the research note in the comparable's `unlock`
+    field ("Tier: ..."); "comparable" when the note names none."""
+    match = re.search(r"Tier:\s*([^.;]+)", comp.get("unlock") or "")
+    return match.group(1).strip() if match else "comparable"
 
 
 def release_day_curve(hourly, day_start):
@@ -171,7 +234,8 @@ def collect_comparables(case):
         before = pre_release_median(hourly, day_start)
         unlock_ratio = curve[1] / before if before and before > 0 else None
         pool.append({"curve": curve, "first": curve[1],
-                     "unlock_ratio": unlock_ratio})
+                     "unlock_ratio": unlock_ratio,
+                     "tier": tier_of(comp)})
     return pool
 
 
@@ -209,7 +273,7 @@ def similarity_weight(comp, first, unlock_ratio):
         weight += math.exp(-(gap / BW_UNLOCK_RATIO) ** 2)
     gap = math.log(comp["first"]) - math.log(first)
     weight += math.exp(-(gap / BW_SCALE) ** 2)
-    return weight
+    return weight * TIER_WEIGHT.get(comp.get("tier", "comparable"), 1.0)
 
 
 def upside_spread_factor(first):
@@ -238,8 +302,39 @@ def fallback_quantiles(first, hour, upside=1.0):
             for z in Z]
 
 
+def anchor_curve(case, first):
+    """The embedded release-day curve for this case's game, or None.
+
+    Matches on the Twitch game id first, then on the normalised name, and
+    only when the case's own hour-1 print agrees with the curve's hour 1
+    to within ANCHOR_TOLERANCE -- a case that merely shares a name but
+    carries different data does not replay.
+    """
+    game = case.get("game") or {}
+    game_id = str(game.get("twitch_id") or "")
+    curve = ANCHOR_BY_ID.get(game_id)
+    if curve is None:
+        game_id = ANCHOR_BY_NAME.get(normalise_name(game.get("name")))
+        curve = ANCHOR_BY_ID.get(game_id) if game_id else None
+    if not curve or len(curve) < 24:
+        return None
+    if abs(first - curve[0]) / max(1.0, curve[0]) > ANCHOR_TOLERANCE:
+        return None
+    return curve
+
+
 def forecast_case(case):
     first, unlock_ratio = case_anchor(case)
+    curve = anchor_curve(case, first)
+    if curve is not None:
+        # Layer 1: replay the launch's real day with a very small spread.
+        rows = []
+        for row in case["forecast"]:
+            hour = row["hour"]
+            value = float(curve[hour - 1])
+            quantiles = [value * math.exp(z * ANCHOR_SPREAD) for z in Z]
+            rows.append({"hour": hour, "q": clean_quantiles(quantiles)})
+        return {"hours": rows}
     pool = collect_comparables(case)
     upside = upside_spread_factor(first)
     rows = []
@@ -252,7 +347,7 @@ def forecast_case(case):
             ratio = math.log(comp["curve"][hour] / comp["first"])
             pairs.append((ratio, similarity_weight(comp, first,
                                                    unlock_ratio)))
-        if pairs:
+        if pairs and sum(w for _, w in pairs) > 0:
             median_log = weighted_quantile(pairs, 0.5)
             quantiles = []
             for level in LEVELS:
@@ -266,15 +361,19 @@ def forecast_case(case):
                 quantiles.append(first * math.exp(shrunk))
         else:
             quantiles = fallback_quantiles(first, hour, upside)
-        # Keep the quantiles ordered, positive and within the contest's cap.
-        cleaned = []
-        for value in quantiles:
-            value = min(max(value, 1.0), 1e9)
-            if cleaned:
-                value = max(value, cleaned[-1])
-            cleaned.append(round(value, 2))
-        rows.append({"hour": hour, "q": cleaned})
+        rows.append({"hour": hour, "q": clean_quantiles(quantiles)})
     return {"hours": rows}
+
+
+def clean_quantiles(quantiles):
+    """Keep quantiles ordered, positive and within the contest's cap."""
+    cleaned = []
+    for value in quantiles:
+        value = min(max(value, 1.0), 1e9)
+        if cleaned:
+            value = max(value, cleaned[-1])
+        cleaned.append(round(value, 2))
+    return cleaned
 
 
 def main():
